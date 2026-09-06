@@ -1,0 +1,43 @@
+services:
+  hsib-ai:
+    build: .
+    container_name: hsib-ai
+
+    ports:
+      - "4100:4000"
+
+    volumes:
+      - ./app:/app/app
+      - ./frontend:/app/frontend
+      - ./config:/app/config
+      - hf-cache:/root/.cache/huggingface
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "3"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      HF_HOME: /root/.cache/huggingface
+
+      # CTFd is on the other host (192.168.130.203).
+      # HSIB-AI is on 192.168.130.143.
+      CTFD_INTERNAL_URL: "http://192.168.130.203:8000"
+      CTFD_ME_ENDPOINT: "/api/v1/users/me"
+      CTFD_SESSION_COOKIE: "session"
+
+      # CTFd's standard profile field used for the province.
+      # Recommended: set the province in the user's "Affiliation" field.
+      CTFD_PROVINCE_FIELD: "affiliation"
+
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+
