@@ -22,7 +22,9 @@ from transformers import pipeline
 APP_VERSION = "3.0.0"
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 
-CHALLENGE_ID = 19
+HSIB_CHALLENGE_ID = 19
+CTFD_CHALLENGE_ID = 106
+CHALLENGE_ID = HSIB_CHALLENGE_ID
 INITIAL_FLAG = "HASIB{ldap_injection_0119}"
 
 # Hasib must be reachable from inside this container.
@@ -35,7 +37,29 @@ Hasib_SESSION_COOKIE = os.getenv("Hasib_SESSION_COOKIE", "session")
 # field. The code also checks several common names as fallbacks.
 Hasib_PROVINCE_FIELD = os.getenv("Hasib_PROVINCE_FIELD", "affiliation").strip()
 
+# ============================================================
+# HadiHasib Integration
+# ============================================================
 
+CTFD_INTERNAL_URL = os.getenv(
+    "CTFD_INTERNAL_URL",
+    "http://192.168.130.203:8000"
+).rstrip("/")
+
+CTFD_ME_ENDPOINT = os.getenv(
+    "CTFD_ME_ENDPOINT",
+    "/api/v1/users/me"
+)
+
+CTFD_ATTEMPT_ENDPOINT = os.getenv(
+    "CTFD_ATTEMPT_ENDPOINT",
+    "/api/v1/challenges/attempt"
+)
+
+CTFD_SESSION_COOKIE = os.getenv(
+    "CTFD_SESSION_COOKIE",
+    "session"
+)
 # ============================================================
 # Paths
 # ============================================================
@@ -453,6 +477,159 @@ async def get_Hasib_current_user(request: Request) -> tuple[dict[str, Any] | Non
 
     return user, None
 
+# ============================================================
+# hadihasib Session / Auto Submit
+# ============================================================
+
+import re
+import httpx
+
+
+async def submit_flag_to_ctfd(
+    request: Request,
+    flag: str,
+) -> tuple[bool, str, str]:
+
+    session_cookie = request.cookies.get(CTFD_SESSION_COOKIE)
+
+    if not session_cookie:
+        print("[CTFd] Session cookie not found.")
+        return (
+            False,
+            "authentication_required",
+            "CTFd session cookie not found.",
+        )
+
+    cookie_header = f"{CTFD_SESSION_COOKIE}={session_cookie}"
+
+    base_url = CTFD_INTERNAL_URL.rstrip("/")
+    attempt_url = f"{base_url}{CTFD_ATTEMPT_ENDPOINT}"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=3.0),
+            follow_redirects=False,
+        ) as client:
+
+            # -------------------------------------------------
+            # 1. Get CTFd page using the user's existing session
+            # -------------------------------------------------
+            page_response = await client.get(
+                f"{base_url}/",
+                headers={
+                    "Cookie": cookie_header,
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+
+            print(f"[CTFd] Homepage HTTP {page_response.status_code}")
+
+            if page_response.status_code >= 300:
+                print(
+                    f"[CTFd] Homepage failed: "
+                    f"{page_response.text[:300]}"
+                )
+                return (
+                    False,
+                    f"http_{page_response.status_code}",
+                    "Unable to obtain CTFd CSRF nonce.",
+                )
+
+            # -------------------------------------------------
+            # 2. Extract csrfNonce from window.init
+            # -------------------------------------------------
+            nonce_match = re.search(
+                r"""['"]csrfNonce['"]\s*:\s*['"]([^'"]+)['"]""",
+                page_response.text,
+            )
+
+            if not nonce_match:
+                print("[CTFd] CSRF nonce not found in homepage.")
+                return (
+                    False,
+                    "csrf_nonce_missing",
+                    "CTFd CSRF nonce was not found.",
+                )
+
+            csrf_nonce = nonce_match.group(1)
+
+            print("[CTFd] CSRF nonce obtained successfully.")
+
+            # -------------------------------------------------
+            # 3. Submit the challenge flag
+            # -------------------------------------------------
+            payload = {
+                "challenge_id": CTFD_CHALLENGE_ID,
+                "submission": flag,
+            }
+
+            response = await client.post(
+                attempt_url,
+                headers={
+                    "Cookie": cookie_header,
+                    "CSRF-Token": csrf_nonce,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+
+    except httpx.RequestError as exc:
+        print(f"[CTFd] Connection error: {exc}")
+        return (
+            False,
+            "connection_error",
+            "CTFd is unreachable.",
+        )
+
+    print(f"[CTFd] Submit HTTP {response.status_code}")
+
+    if response.status_code >= 300:
+        print(
+            f"[CTFd] Submit failed: "
+            f"{response.text[:500]}"
+        )
+
+        return (
+            False,
+            f"http_{response.status_code}",
+            "CTFd submission request failed.",
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        print("[CTFd] Invalid JSON response.")
+        return (
+            False,
+            "invalid_json",
+            "CTFd returned invalid JSON.",
+        )
+
+    result_data = data.get("data", {})
+
+    if not isinstance(result_data, dict):
+        result_data = {}
+
+    status = result_data.get("status", "")
+    message = result_data.get("message", "")
+
+    print(f"[CTFd] Submission status: {status}")
+    print(f"[CTFd] Submission message: {message}")
+
+    if status == "correct":
+        return True, "correct", message
+
+    if status == "already_solved":
+        return True, "already_solved", message
+
+    if status == "authentication_required":
+        return False, "authentication_required", message
+
+    if status == "ratelimited":
+        return False, "ratelimited", message
+
+    return False, status or "unknown", message
 
 # ============================================================
 # Request Model
@@ -1082,8 +1259,8 @@ async def chat(request: ChatRequest, http_request: Request):
         "response": result["response"],
     }
 
-    # --------------------------------------------------------
-    # Final province flag
+        # --------------------------------------------------------
+    # Final province flag + automatic CTFd submission
     # --------------------------------------------------------
 
     if (
@@ -1099,8 +1276,8 @@ async def chat(request: ChatRequest, http_request: Request):
             response["stage"] = "VERIFYING_ADMIN"
             response["stage_completed"] = False
             response["response"] = (
-                "مراحل فنی کامل شد، اما Flag استان برای حساب شما "
-                "در تنظیمات سیستم وجود ندارد."
+                "مراحل فنی کامل شد، اما Flag استان برای "
+                "حساب شما در تنظیمات سیستم وجود ندارد."
             )
 
             return response
@@ -1120,18 +1297,70 @@ async def chat(request: ChatRequest, http_request: Request):
 
             return response
 
+        # ----------------------------------------------------
+        # Submit automatically to CTFd
+        # ----------------------------------------------------
+
+        submitted, ctfd_status, ctfd_message = (
+            await submit_flag_to_ctfd(
+                http_request,
+                province_flag,
+            )
+        )
+
+        if not submitted:
+            print(
+                f"[CTFd] Auto-submit failed: "
+                f"{ctfd_status} - {ctfd_message}"
+            )
+
+            response["stage"] = "COMPLETED"
+            response["stage_completed"] = False
+            response["ctfd_submitted"] = False
+
+            if ctfd_status == "authentication_required":
+                response["response"] = (
+                    "تمام مراحل Challenge 19 تکمیل شد، "
+                    "اما Session حساب CTFd معتبر نیست.\n\n"
+                    "لطفاً دوباره وارد CTFd شوید."
+                )
+
+            elif ctfd_status == "ratelimited":
+                response["response"] = (
+                    "تمام مراحل Challenge 19 تکمیل شد، "
+                    "اما CTFd درخواست را به‌دلیل محدودیت ارسال "
+                    "پذیرفت.\n\n"
+                    "لطفاً چند لحظه بعد دوباره پیام بده."
+                )
+
+            else:
+                response["response"] = (
+                    "تمام مراحل Challenge 19 تکمیل شد، "
+                    "اما ثبت خودکار در CTFd انجام نشد.\n\n"
+                    "سیستم در تلاش بعدی دوباره Submit خواهد کرد."
+                )
+
+            return response
+
+        # ----------------------------------------------------
+        # CTFd accepted the submission
+        # ----------------------------------------------------
+
         session["province_flag_issued"] = True
         session["completed"] = True
 
         response["stage"] = "COMPLETED"
         response["stage_completed"] = True
+        response["ctfd_submitted"] = True
+        response["ctfd_status"] = ctfd_status
+
         response["response"] = (
             "🎉 تمام مراحل Challenge 19 با موفقیت تکمیل شد.\n\n"
-            "استان حساب Hasib به‌صورت خودکار شناسایی شد.\n\n"
-            "### Flag نهایی\n\n"
-            f"```text\n{province_flag}\n```\n\n"
-            "Flag را در Hasib ثبت کن."
+            "✅ هویت حساب شما تأیید شد.\n"
+            "✅ استان حساب به‌صورت خودکار شناسایی شد.\n"
+            "✅ Flag مخصوص حساب شما به‌صورت خودکار "
+            "در CTFd ثبت شد.\n\n"
+            "🏆 Challenge 19 با موفقیت Solve شد."
         )
-        response["flag"] = province_flag
-
-    return response
+        
+    return response   
